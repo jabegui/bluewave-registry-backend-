@@ -1,0 +1,22 @@
+{
+  "name": "bluewave-registry-backend",
+  "version": "0.1.0",
+  "description": "Backend API for Bluewave Registry — order management, account auth, and Sunbiz data ingestion.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "migrate": "psql \"$DATABASE_URL\" -f src/schema.sql",
+    "ingest:sunbiz": "node src/connectors/sunbizIngest.js"
+  },
+  "dependencies": {
+    "basic-ftp": "^5.0.5",
+    "bcrypt": "^5.1.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "pg": "^8.12.0"
+  }
+}
