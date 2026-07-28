@@ -3,17 +3,14 @@ const crypto = require('crypto');
 const db = require('../db');
 const { requireAuth, requireAdminKey } = require('../middleware/auth');
 const { buildSearchMatrix, SERVICE_CATALOG } = require('../services/orderMatrix');
+const { sendEmail, orderConfirmationEmail, staffAlertEmail, STAFF_ALERT_ADDRESS } = require('../services/mailer');
 
 const router = express.Router();
 
 function generateReferenceNumber() {
-  // 6-digit reference number, e.g. "402917" — matches the style
-  // used in the sample vendor reports this product is modeled on.
   return String(crypto.randomInt(100000, 999999));
 }
 
-// GET /api/services — the public service catalog, used by the
-// frontend to render the ordering checkboxes without hardcoding them.
 router.get('/services/catalog', (req, res) => {
   const catalog = Object.entries(SERVICE_CATALOG).map(([key, val]) => ({
     key,
@@ -23,8 +20,6 @@ router.get('/services/catalog', (req, res) => {
   res.json({ services: catalog });
 });
 
-// POST /api/orders — create a new order for the logged-in account.
-// Body: { matterName, subjects: [{name, entityType, county}], services: [serviceKey, ...] }
 router.post('/', requireAuth, async (req, res) => {
   const { matterName, subjects, services } = req.body;
 
@@ -67,15 +62,19 @@ router.post('/', requireAuth, async (req, res) => {
     }
 
     await client.query('COMMIT');
-    res.status(201).json({
-      order: {
-        id: order.id,
-        referenceNumber: order.reference_number,
-        matterName: matterName || null,
-        createdAt: order.created_at,
-        lineItemCount: matrix.length,
-      },
-    });
+
+    const orderSummary = {
+      id: order.id,
+      referenceNumber: order.reference_number,
+      matterName: matterName || null,
+      createdAt: order.created_at,
+      lineItemCount: matrix.length,
+    };
+
+    res.status(201).json({ order: orderSummary });
+
+    sendEmail({ to: req.account.email, ...orderConfirmationEmail(orderSummary) });
+    sendEmail({ to: STAFF_ALERT_ADDRESS, ...staffAlertEmail(orderSummary, req.account.email) });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Order creation error:', err);
@@ -85,7 +84,6 @@ router.post('/', requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/orders — list the logged-in account's orders (summary only)
 router.get('/', requireAuth, async (req, res) => {
   try {
     const result = await db.query(
@@ -107,9 +105,6 @@ router.get('/', requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/orders/:reference — full detail for one order: every
-// subject, every search request line item, its status, and any
-// attached documents ready for download.
 router.get('/:reference', requireAuth, async (req, res) => {
   try {
     const orderResult = await db.query(
@@ -148,9 +143,6 @@ router.get('/:reference', requireAuth, async (req, res) => {
   }
 });
 
-// PATCH /api/orders/internal/search-requests/:id — internal endpoint
-// for staff tooling / connector scripts to update a line item's
-// status once a search comes back. Not exposed to clients.
 router.patch('/internal/search-requests/:id', requireAdminKey, async (req, res) => {
   const { status, resultSummary, searchedThrough } = req.body;
   const allowedStatuses = ['queued', 'in_progress', 'completed', 'no_record', 'error'];
