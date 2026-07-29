@@ -6,6 +6,8 @@ const morgan = require('morgan');
 const authRoutes = require('./routes/auth');
 const orderRoutes = require('./routes/orders');
 const entityRoutes = require('./routes/entities');
+const accountRoutes = require('./routes/accounts');
+const invoiceRoutes = require('./routes/invoices');
 
 const app = express();
 
@@ -18,6 +20,8 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 app.use('/api/auth', authRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/entities', entityRoutes);
+app.use('/api/internal/accounts', accountRoutes);
+app.use('/api/internal', invoiceRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found.' });
