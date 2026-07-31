@@ -172,4 +172,31 @@ router.post('/orders', requireAdminKey, async (req, res) => {
   }
 });
 
+// PATCH /api/internal/orders/:reference/status — staff changes an
+// order's overall status (e.g. Open -> Closed/Completed). This is
+// separate from the per-line-item status updates below, which track
+// individual search requests within the order.
+router.patch('/orders/:reference/status', requireAdminKey, async (req, res) => {
+  const { status } = req.body;
+  const allowedStatuses = ['open', 'in_progress', 'completed', 'cancelled'];
+
+  if (!status || !allowedStatuses.includes(status)) {
+    return res.status(400).json({ error: `Status must be one of: ${allowedStatuses.join(', ')}` });
+  }
+
+  try {
+    const result = await db.query(
+      `UPDATE orders SET status = $1 WHERE reference_number = $2 RETURNING id, reference_number, status`,
+      [status, req.params.reference]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+    res.json({ order: result.rows[0] });
+  } catch (err) {
+    console.error('Update order status error:', err);
+    res.status(500).json({ error: 'Could not update order status.' });
+  }
+});
+
 module.exports = router;

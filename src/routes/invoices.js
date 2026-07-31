@@ -230,25 +230,37 @@ router.get('/service-prices', requireAdminKey, async (req, res) => {
 });
 
 // PATCH /api/internal/service-prices/:serviceType — update the default
-// price (and/or label) used for a service going forward. This does
-// NOT retroactively change already-generated invoices — use the
+// price and/or label used for a service going forward. Also accepts
+// an optional newServiceType to correct a mismatched service_type key
+// (e.g. if it doesn't match the key used in orderMatrix.js's
+// SERVICE_CATALOG, the price won't be picked up when invoicing). This
+// does NOT retroactively change already-generated invoices — use the
 // line-item routes above for that.
 router.patch('/service-prices/:serviceType', requireAdminKey, async (req, res) => {
-  const { defaultPriceCents, label } = req.body;
+  const { defaultPriceCents, label, newServiceType } = req.body;
   try {
     const result = await db.query(
       `UPDATE service_prices
        SET default_price_cents = COALESCE($1, default_price_cents),
-           label = COALESCE($2, label)
-       WHERE service_type = $3
+           label = COALESCE($2, label),
+           service_type = COALESCE($3, service_type)
+       WHERE service_type = $4
        RETURNING *`,
-      [defaultPriceCents !== undefined ? defaultPriceCents : null, label || null, req.params.serviceType]
+      [
+        defaultPriceCents !== undefined ? defaultPriceCents : null,
+        label || null,
+        newServiceType || null,
+        req.params.serviceType,
+      ]
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Service price not found.' });
     }
     res.json({ servicePrice: result.rows[0] });
   } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'A service price with that service_type already exists.' });
+    }
     console.error('Update service price error:', err);
     res.status(500).json({ error: 'Could not update service price.' });
   }
