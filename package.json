@@ -1,7 +1,7 @@
 {
   "name": "bluewave-registry-backend",
   "version": "0.1.0",
-  "description": "Backend API for Bluewave Registry — order management, account auth, and Sunbiz data ingestion.",
+  "description": "Backend API for Bluewave Registry â order management, account auth, and Sunbiz data ingestion.",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
@@ -17,6 +17,7 @@
     "express": "^4.19.2",
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
     "pdfkit": "^0.15.0",
     "pg": "^8.12.0"
   }
