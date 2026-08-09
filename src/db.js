@@ -64,6 +64,24 @@ const migrations = [
   // regardless of this flag (enforced in the route, not here).
   `ALTER TABLE order_files ADD COLUMN IF NOT EXISTS uploaded_by TEXT NOT NULL DEFAULT 'staff'`,
   `ALTER TABLE order_files ADD COLUMN IF NOT EXISTS visible_to_client BOOLEAN NOT NULL DEFAULT false`,
+
+  // Individual filing rows staff enters for a search request (one row
+  // per UCC financing statement, lien, termination, etc. found for
+  // that subject/jurisdiction/index combo). Backs the branded search
+  // result report PDF -- staff types these in, then generates the
+  // report from them instead of hand-building a document.
+  `CREATE TABLE IF NOT EXISTS search_request_filings (
+    id SERIAL PRIMARY KEY,
+    search_request_id INTEGER NOT NULL REFERENCES search_requests(id) ON DELETE CASCADE,
+    file_date DATE,
+    file_number TEXT,
+    filing_type TEXT,
+    secured_party TEXT,
+    secured_party_location TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_search_request_filings_request ON search_request_filings(search_request_id)`,
 ];
 
 (async () => {
