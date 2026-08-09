@@ -3,7 +3,8 @@ const crypto = require('crypto');
 const multer = require('multer');
 const db = require('../db');
 const { requireAdminKey } = require('../middleware/auth');
-const { buildSearchMatrix } = require('../services/orderMatrix');
+const { buildSearchMatrix, SERVICE_CATALOG } = require('../services/orderMatrix');
+const { renderSearchResultPdf } = require('../services/searchResultPdf');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
@@ -354,6 +355,180 @@ router.patch('/orders/:reference/items/:itemId', requireAdminKey, async (req, re
   } catch (err) {
     console.error('Update item status error:', err);
     res.status(500).json({ error: 'Could not update item.' });
+  }
+});
+
+// ---------------------------------------------------------------
+// Search result filings + report generation
+// ---------------------------------------------------------------
+
+// Confirms the item belongs to the order in the URL and returns its
+// id, so every filings/report route below can't be pointed at a
+// search_request that belongs to a different order.
+async function findItemOnOrder(reference, itemId) {
+  const result = await db.query(
+    `SELECT sr.id FROM search_requests sr
+     JOIN search_subjects ss ON ss.id = sr.subject_id
+     JOIN orders o ON o.id = ss.order_id
+     WHERE o.reference_number = $1 AND sr.id = $2`,
+    [reference, itemId]
+  );
+  return result.rows[0] || null;
+}
+
+router.get('/orders/:reference/items/:itemId/filings', requireAdminKey, async (req, res) => {
+  try {
+    const item = await findItemOnOrder(req.params.reference, req.params.itemId);
+    if (!item) {
+      return res.status(404).json({ error: 'Item not found on this order.' });
+    }
+    const result = await db.query(
+      `SELECT id, file_date, file_number, filing_type, secured_party, secured_party_location, sort_order
+       FROM search_request_filings WHERE search_request_id = $1 ORDER BY sort_order, id`,
+      [req.params.itemId]
+    );
+    res.json({ filings: result.rows });
+  } catch (err) {
+    console.error('List filings error:', err);
+    res.status(500).json({ error: 'Could not load filings.' });
+  }
+});
+
+// PUT replaces the full filing set for an item -- simplest match for
+// a "type the table in, save" UI, since staff rarely edits one row of
+// an existing filing without also re-checking the rest.
+router.put('/orders/:reference/items/:itemId/filings', requireAdminKey, async (req, res) => {
+  const { filings } = req.body;
+  if (!Array.isArray(filings)) {
+    return res.status(400).json({ error: 'filings must be an array.' });
+  }
+
+  const client = await db.pool.connect();
+  try {
+    const item = await findItemOnOrder(req.params.reference, req.params.itemId);
+    if (!item) {
+      client.release();
+      return res.status(404).json({ error: 'Item not found on this order.' });
+    }
+
+    await client.query('BEGIN');
+    await client.query(`DELETE FROM search_request_filings WHERE search_request_id = $1`, [req.params.itemId]);
+
+    let sortOrder = 0;
+    for (const f of filings) {
+      await client.query(
+        `INSERT INTO search_request_filings
+           (search_request_id, file_date, file_number, filing_type, secured_party, secured_party_location, sort_order)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [req.params.itemId, f.fileDate || null, f.fileNumber || null, f.filingType || null,
+          f.securedParty || null, f.securedPartyLocation || null, sortOrder++]
+      );
+    }
+    await client.query('COMMIT');
+
+    const result = await db.query(
+      `SELECT id, file_date, file_number, filing_type, secured_party, secured_party_location, sort_order
+       FROM search_request_filings WHERE search_request_id = $1 ORDER BY sort_order, id`,
+      [req.params.itemId]
+    );
+    res.json({ filings: result.rows });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Save filings error:', err);
+    res.status(500).json({ error: 'Could not save filings.' });
+  } finally {
+    client.release();
+  }
+});
+
+// POST generates the branded search result report PDF from whatever
+// filings are currently saved for this item (an empty set renders as
+// "NONE OF RECORD"), saves it as a client-visible order file, and
+// marks the item completed / no_record so the dashboard progress
+// count and client portal status stay in sync automatically.
+router.post('/orders/:reference/items/:itemId/report', requireAdminKey, async (req, res) => {
+  try {
+    const orderResult = await db.query(
+      `SELECT o.id, o.reference_number, a.name, a.company_name
+       FROM orders o LEFT JOIN accounts a ON a.id = o.account_id
+       WHERE o.reference_number = $1`,
+      [req.params.reference]
+    );
+    const orderRow = orderResult.rows[0];
+    if (!orderRow) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+
+    const itemResult = await db.query(
+      `SELECT sr.id, sr.service_type, sr.jurisdiction, sr.searched_through, ss.name AS subject_name
+       FROM search_requests sr
+       JOIN search_subjects ss ON ss.id = sr.subject_id
+       JOIN orders o ON o.id = ss.order_id
+       WHERE o.reference_number = $1 AND sr.id = $2`,
+      [req.params.reference, req.params.itemId]
+    );
+    const item = itemResult.rows[0];
+    if (!item) {
+      return res.status(404).json({ error: 'Item not found on this order.' });
+    }
+
+    const filingsResult = await db.query(
+      `SELECT file_date, file_number, filing_type, secured_party, secured_party_location
+       FROM search_request_filings WHERE search_request_id = $1 ORDER BY sort_order, id`,
+      [req.params.itemId]
+    );
+    const filings = filingsResult.rows;
+
+    const searchedThrough = req.body.searchedThrough || item.searched_through || new Date();
+    const serviceLabel = (SERVICE_CATALOG[item.service_type] && SERVICE_CATALOG[item.service_type].label) || item.service_type;
+
+    const pdfBuffer = await renderSearchResultPdf({
+      order: { reference_number: orderRow.reference_number },
+      account: { name: orderRow.name, company_name: orderRow.company_name },
+      item: {
+        id: item.id,
+        subject_name: item.subject_name,
+        jurisdiction: item.jurisdiction,
+        service_type: item.service_type,
+        service_label: serviceLabel,
+        searched_through: searchedThrough,
+      },
+      filings,
+    });
+
+    const client = await db.pool.connect();
+    let fileRow;
+    try {
+      await client.query('BEGIN');
+
+      const fileName = `${orderRow.reference_number}-${item.id}-search-result.pdf`;
+      const insertResult = await client.query(
+        `INSERT INTO order_files (order_id, file_name, mime_type, file_size, file_data, uploaded_by, visible_to_client)
+         VALUES ($1, $2, 'application/pdf', $3, $4, 'staff', true)
+         RETURNING id, file_name, mime_type, file_size, uploaded_at, uploaded_by, visible_to_client`,
+        [orderRow.id, fileName, pdfBuffer.length, pdfBuffer]
+      );
+      fileRow = insertResult.rows[0];
+
+      const newStatus = filings.length > 0 ? 'completed' : 'no_record';
+      await client.query(
+        `UPDATE search_requests SET status = $1, searched_through = COALESCE($2, searched_through), completed_at = now()
+         WHERE id = $3`,
+        [newStatus, req.body.searchedThrough || null, req.params.itemId]
+      );
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.status(201).json({ file: fileRow });
+  } catch (err) {
+    console.error('Generate search result report error:', err);
+    res.status(500).json({ error: 'Could not generate report.' });
   }
 });
 
