@@ -4,7 +4,7 @@ const multer = require('multer');
 const db = require('../db');
 const { requireAdminKey } = require('../middleware/auth');
 const { buildSearchMatrix, SERVICE_CATALOG } = require('../services/orderMatrix');
-const { renderSearchResultPdf } = require('../services/searchResultPdf');
+const { renderCombinedSearchReportPdf } = require('../services/searchResultPdf');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
@@ -14,6 +14,12 @@ function generateReferenceNumber() {
 }
 
 const ITEM_STATUS_OPTIONS = ['queued', 'in_progress', 'completed', 'no_record', 'error'];
+
+// Service types that are genuine index searches (UCC / lien / county
+// recorder) rather than document retrievals (certificate of status,
+// certified articles). Only these ever show a filings editor or get
+// included in the combined search report PDF.
+const SEARCH_REPORT_TYPES = ['ucc_search', 'fed_state_lien_search', 'county_recorder_search'];
 
 // GET /api/internal/orders -- the main dashboard list.
 router.get('/orders', requireAdminKey, async (req, res) => {
@@ -359,11 +365,11 @@ router.patch('/orders/:reference/items/:itemId', requireAdminKey, async (req, re
 });
 
 // ---------------------------------------------------------------
-// Search result filings + report generation
+// Search result filings + combined report generation
 // ---------------------------------------------------------------
 
 // Confirms the item belongs to the order in the URL and returns its
-// id, so every filings/report route below can't be pointed at a
+// id, so every filings route below can't be pointed at a
 // search_request that belongs to a different order.
 async function findItemOnOrder(reference, itemId) {
   const result = await db.query(
@@ -441,12 +447,15 @@ router.put('/orders/:reference/items/:itemId/filings', requireAdminKey, async (r
   }
 });
 
-// POST generates the branded search result report PDF from whatever
-// filings are currently saved for this item (an empty set renders as
-// "NONE OF RECORD"), saves it as a client-visible order file, and
-// marks the item completed / no_record so the dashboard progress
-// count and client portal status stay in sync automatically.
-router.post('/orders/:reference/items/:itemId/report', requireAdminKey, async (req, res) => {
+// POST /api/internal/orders/:reference/report — generates ONE
+// combined PDF covering every in-scope search-type item on the order
+// (UCC / lien / county recorder searches; certificate-of-status and
+// certified-articles items are document retrievals, never part of
+// this report), using whatever filings are currently saved for each.
+// Saves it as a single client-visible order file, and marks each
+// included item completed / no_record so the dashboard progress count
+// and client portal status stay in sync automatically.
+router.post('/orders/:reference/report', requireAdminKey, async (req, res) => {
   try {
     const orderResult = await db.query(
       `SELECT o.id, o.reference_number, a.name, a.company_name
@@ -459,41 +468,44 @@ router.post('/orders/:reference/items/:itemId/report', requireAdminKey, async (r
       return res.status(404).json({ error: 'Order not found.' });
     }
 
-    const itemResult = await db.query(
+    const itemsResult = await db.query(
       `SELECT sr.id, sr.service_type, sr.jurisdiction, sr.searched_through, ss.name AS subject_name
        FROM search_requests sr
        JOIN search_subjects ss ON ss.id = sr.subject_id
-       JOIN orders o ON o.id = ss.order_id
-       WHERE o.reference_number = $1 AND sr.id = $2`,
-      [req.params.reference, req.params.itemId]
+       WHERE ss.order_id = $1 AND sr.service_type = ANY($2)
+       ORDER BY ss.name, sr.service_type`,
+      [orderRow.id, SEARCH_REPORT_TYPES]
     );
-    const item = itemResult.rows[0];
-    if (!item) {
-      return res.status(404).json({ error: 'Item not found on this order.' });
+    const items = itemsResult.rows;
+    if (items.length === 0) {
+      return res.status(400).json({ error: 'This order has no UCC/lien search items to report on.' });
     }
 
-    const filingsResult = await db.query(
-      `SELECT file_date, file_number, filing_type, secured_party, secured_party_location
-       FROM search_request_filings WHERE search_request_id = $1 ORDER BY sort_order, id`,
-      [req.params.itemId]
-    );
-    const filings = filingsResult.rows;
+    const sections = [];
+    for (const item of items) {
+      const filingsResult = await db.query(
+        `SELECT file_date, file_number, filing_type, secured_party, secured_party_location
+         FROM search_request_filings WHERE search_request_id = $1 ORDER BY sort_order, id`,
+        [item.id]
+      );
+      const serviceLabel = (SERVICE_CATALOG[item.service_type] && SERVICE_CATALOG[item.service_type].label) || item.service_type;
+      sections.push({
+        item: {
+          id: item.id,
+          subject_name: item.subject_name,
+          jurisdiction: item.jurisdiction,
+          service_type: item.service_type,
+          service_label: serviceLabel,
+          searched_through: item.searched_through || new Date(),
+        },
+        filings: filingsResult.rows,
+      });
+    }
 
-    const searchedThrough = req.body.searchedThrough || item.searched_through || new Date();
-    const serviceLabel = (SERVICE_CATALOG[item.service_type] && SERVICE_CATALOG[item.service_type].label) || item.service_type;
-
-    const pdfBuffer = await renderSearchResultPdf({
+    const pdfBuffer = await renderCombinedSearchReportPdf({
       order: { reference_number: orderRow.reference_number },
       account: { name: orderRow.name, company_name: orderRow.company_name },
-      item: {
-        id: item.id,
-        subject_name: item.subject_name,
-        jurisdiction: item.jurisdiction,
-        service_type: item.service_type,
-        service_label: serviceLabel,
-        searched_through: searchedThrough,
-      },
-      filings,
+      sections,
     });
 
     const client = await db.pool.connect();
@@ -501,7 +513,7 @@ router.post('/orders/:reference/items/:itemId/report', requireAdminKey, async (r
     try {
       await client.query('BEGIN');
 
-      const fileName = `${orderRow.reference_number}-${item.id}-search-result.pdf`;
+      const fileName = `${orderRow.reference_number}-search-report.pdf`;
       const insertResult = await client.query(
         `INSERT INTO order_files (order_id, file_name, mime_type, file_size, file_data, uploaded_by, visible_to_client)
          VALUES ($1, $2, 'application/pdf', $3, $4, 'staff', true)
@@ -510,12 +522,13 @@ router.post('/orders/:reference/items/:itemId/report', requireAdminKey, async (r
       );
       fileRow = insertResult.rows[0];
 
-      const newStatus = filings.length > 0 ? 'completed' : 'no_record';
-      await client.query(
-        `UPDATE search_requests SET status = $1, searched_through = COALESCE($2, searched_through), completed_at = now()
-         WHERE id = $3`,
-        [newStatus, req.body.searchedThrough || null, req.params.itemId]
-      );
+      for (const section of sections) {
+        const newStatus = section.filings.length > 0 ? 'completed' : 'no_record';
+        await client.query(
+          `UPDATE search_requests SET status = $1, completed_at = now() WHERE id = $2`,
+          [newStatus, section.item.id]
+        );
+      }
 
       await client.query('COMMIT');
     } catch (err) {
@@ -527,7 +540,7 @@ router.post('/orders/:reference/items/:itemId/report', requireAdminKey, async (r
 
     res.status(201).json({ file: fileRow });
   } catch (err) {
-    console.error('Generate search result report error:', err);
+    console.error('Generate combined search report error:', err);
     res.status(500).json({ error: 'Could not generate report.' });
   }
 });
@@ -631,3 +644,4 @@ router.delete('/files/:fileId', requireAdminKey, async (req, res) => {
 });
 
 module.exports = router;
+
