@@ -19,7 +19,7 @@ router.get('/orders', requireAdminKey, async (req, res) => {
   try {
     const result = await db.query(
       `SELECT o.id, o.reference_number, o.matter_name, o.status, o.created_at,
-              o.received_at, o.source_email, o.priority, o.due_date,
+              o.received_at, o.source_email, o.priority, o.due_date, o.customer_notes,
               a.name AS account_name, a.company_name, a.account_number, o.contact_email,
               COUNT(DISTINCT sr.id) AS total_items,
               COUNT(DISTINCT sr.id) FILTER (WHERE sr.status = 'completed') AS completed_items,
@@ -74,7 +74,8 @@ router.get('/orders/:reference', requireAdminKey, async (req, res) => {
     );
 
     const filesResult = await db.query(
-      `SELECT id, file_name, mime_type, file_size, uploaded_at FROM order_files WHERE order_id = $1 ORDER BY uploaded_at DESC`,
+      `SELECT id, file_name, mime_type, file_size, uploaded_at, uploaded_by, visible_to_client
+       FROM order_files WHERE order_id = $1 ORDER BY uploaded_at DESC`,
       [order.id]
     );
 
@@ -90,12 +91,12 @@ router.get('/orders/:reference', requireAdminKey, async (req, res) => {
   }
 });
 
-// POST /api/internal/orders â staff creates an order manually, for
+// POST /api/internal/orders — staff creates an order manually, for
 // requests that came in by email (or phone) instead of through the
 // website's own order form. Finds an existing client account by
 // email, or creates one on the spot (same as the email-intake account
 // flow in accounts.js), then builds the order exactly like the public
-// order flow does: subjects Ã services -> search_requests.
+// order flow does: subjects × services -> search_requests.
 router.post('/orders', requireAdminKey, async (req, res) => {
   const {
     accountName, accountEmail, companyName, phone,
@@ -202,7 +203,7 @@ router.post('/orders', requireAdminKey, async (req, res) => {
     await client.query('ROLLBACK');
     console.error('Manual order creation error:', err);
     if (err.code === '23505') {
-      return res.status(409).json({ error: 'That reference number collided â please try again.' });
+      return res.status(409).json({ error: 'That reference number collided — please try again.' });
     }
     res.status(500).json({ error: 'Could not create the order.' });
   } finally {
@@ -210,7 +211,7 @@ router.post('/orders', requireAdminKey, async (req, res) => {
   }
 });
 
-// PATCH /api/internal/orders/:reference/status â staff changes an
+// PATCH /api/internal/orders/:reference/status — staff changes an
 // order's overall status (e.g. Open -> Closed/Completed). This is
 // separate from the per-line-item status updates below, which track
 // individual search requests within the order.
@@ -237,7 +238,7 @@ router.patch('/orders/:reference/status', requireAdminKey, async (req, res) => {
   }
 });
 
-// PATCH /api/internal/orders/:reference â edit intake/tracking fields
+// PATCH /api/internal/orders/:reference — edit intake/tracking fields
 // that aren't the overall status: matter name, when it was actually
 // received, who sent it (if by email), rush priority, due date, and
 // staff-only internal notes.
@@ -272,7 +273,7 @@ router.patch('/orders/:reference', requireAdminKey, async (req, res) => {
   }
 });
 
-// DELETE /api/internal/orders/:reference â permanently removes an
+// DELETE /api/internal/orders/:reference — permanently removes an
 // order and everything attached to it (subjects, search requests,
 // invoice + line items, uploaded files). Used to clear out test
 // orders or duplicates entered by mistake.
@@ -312,7 +313,7 @@ router.delete('/orders/:reference', requireAdminKey, async (req, res) => {
   }
 });
 
-// PATCH /api/internal/orders/:reference/items/:itemId â mark an
+// PATCH /api/internal/orders/:reference/items/:itemId — mark an
 // individual search request (line item) queued / in progress /
 // completed / no record / error. Drives the "X / Y items done"
 // progress shown on the dashboard.
@@ -371,9 +372,9 @@ router.post('/orders/:reference/files', requireAdminKey, upload.single('file'), 
       return res.status(404).json({ error: 'Order not found.' });
     }
     const result = await db.query(
-      `INSERT INTO order_files (order_id, file_name, mime_type, file_size, file_data)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, file_name, mime_type, file_size, uploaded_at`,
+      `INSERT INTO order_files (order_id, file_name, mime_type, file_size, file_data, uploaded_by)
+       VALUES ($1, $2, $3, $4, $5, 'staff')
+       RETURNING id, file_name, mime_type, file_size, uploaded_at, uploaded_by, visible_to_client`,
       [order.id, req.file.originalname, req.file.mimetype, req.file.size, req.file.buffer]
     );
     res.status(201).json({ file: result.rows[0] });
@@ -386,7 +387,7 @@ router.post('/orders/:reference/files', requireAdminKey, upload.single('file'), 
 router.get('/orders/:reference/files', requireAdminKey, async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT f.id, f.file_name, f.mime_type, f.file_size, f.uploaded_at
+      `SELECT f.id, f.file_name, f.mime_type, f.file_size, f.uploaded_at, f.uploaded_by, f.visible_to_client
        FROM order_files f
        JOIN orders o ON o.id = f.order_id
        WHERE o.reference_number = $1
@@ -416,6 +417,28 @@ router.get('/files/:fileId', requireAdminKey, async (req, res) => {
   } catch (err) {
     console.error('Download order file error:', err);
     res.status(500).json({ error: 'Could not download file.' });
+  }
+});
+
+// PATCH /api/internal/files/:fileId/visibility — staff toggles whether
+// a file (usually a completed result staff uploaded) is shared with
+// the client in their portal. Client-uploaded source files are always
+// visible to the client who sent them regardless of this flag.
+router.patch('/files/:fileId/visibility', requireAdminKey, async (req, res) => {
+  const { visibleToClient } = req.body;
+  try {
+    const result = await db.query(
+      `UPDATE order_files SET visible_to_client = $1 WHERE id = $2
+       RETURNING id, file_name, visible_to_client`,
+      [!!visibleToClient, req.params.fileId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'File not found.' });
+    }
+    res.json({ file: result.rows[0] });
+  } catch (err) {
+    console.error('Update file visibility error:', err);
+    res.status(500).json({ error: 'Could not update file visibility.' });
   }
 });
 
