@@ -21,6 +21,16 @@ const ITEM_STATUS_OPTIONS = ['queued', 'in_progress', 'completed', 'no_record', 
 // included in the combined search report PDF.
 const SEARCH_REPORT_TYPES = ['ucc_search', 'fed_state_lien_search', 'county_recorder_search'];
 
+// Default "Index Searched" headline per service type, worded to match
+// what clients are used to seeing from other search providers. Staff
+// can override this per search (stored in search_requests.index_searched)
+// with either a different preset or a fully custom headline.
+const DEFAULT_INDEX_SEARCHED = {
+  ucc_search: 'UCC',
+  fed_state_lien_search: 'Federal Lien/Judgment Lien',
+  county_recorder_search: 'Federal & State Liens/Judgment Lien/UCC-Fixture',
+};
+
 // GET /api/internal/orders -- the main dashboard list.
 router.get('/orders', requireAdminKey, async (req, res) => {
   try {
@@ -373,7 +383,7 @@ router.patch('/orders/:reference/items/:itemId', requireAdminKey, async (req, re
 // search_request that belongs to a different order.
 async function findItemOnOrder(reference, itemId) {
   const result = await db.query(
-    `SELECT sr.id FROM search_requests sr
+    `SELECT sr.id, sr.service_type, sr.index_searched FROM search_requests sr
      JOIN search_subjects ss ON ss.id = sr.subject_id
      JOIN orders o ON o.id = ss.order_id
      WHERE o.reference_number = $1 AND sr.id = $2`,
@@ -393,7 +403,11 @@ router.get('/orders/:reference/items/:itemId/filings', requireAdminKey, async (r
        FROM search_request_filings WHERE search_request_id = $1 ORDER BY sort_order, id`,
       [req.params.itemId]
     );
-    res.json({ filings: result.rows });
+    res.json({
+      filings: result.rows,
+      indexSearched: item.index_searched,
+      defaultIndexSearched: DEFAULT_INDEX_SEARCHED[item.service_type] || null,
+    });
   } catch (err) {
     console.error('List filings error:', err);
     res.status(500).json({ error: 'Could not load filings.' });
@@ -402,9 +416,11 @@ router.get('/orders/:reference/items/:itemId/filings', requireAdminKey, async (r
 
 // PUT replaces the full filing set for an item -- simplest match for
 // a "type the table in, save" UI, since staff rarely edits one row of
-// an existing filing without also re-checking the rest.
+// an existing filing without also re-checking the rest. Also saves
+// the "Index Searched" headline for this search (used on the report),
+// if the caller included one.
 router.put('/orders/:reference/items/:itemId/filings', requireAdminKey, async (req, res) => {
-  const { filings } = req.body;
+  const { filings, indexSearched } = req.body;
   if (!Array.isArray(filings)) {
     return res.status(400).json({ error: 'filings must be an array.' });
   }
@@ -430,6 +446,14 @@ router.put('/orders/:reference/items/:itemId/filings', requireAdminKey, async (r
           f.securedParty || null, f.securedPartyLocation || null, sortOrder++]
       );
     }
+
+    if (indexSearched !== undefined) {
+      await client.query(
+        `UPDATE search_requests SET index_searched = $1 WHERE id = $2`,
+        [indexSearched || null, req.params.itemId]
+      );
+    }
+
     await client.query('COMMIT');
 
     const result = await db.query(
@@ -469,7 +493,7 @@ router.post('/orders/:reference/report', requireAdminKey, async (req, res) => {
     }
 
     const itemsResult = await db.query(
-      `SELECT sr.id, sr.service_type, sr.jurisdiction, sr.searched_through, ss.name AS subject_name
+      `SELECT sr.id, sr.service_type, sr.jurisdiction, sr.searched_through, sr.index_searched, ss.name AS subject_name
        FROM search_requests sr
        JOIN search_subjects ss ON ss.id = sr.subject_id
        WHERE ss.order_id = $1 AND sr.service_type = ANY($2)
@@ -488,7 +512,10 @@ router.post('/orders/:reference/report', requireAdminKey, async (req, res) => {
          FROM search_request_filings WHERE search_request_id = $1 ORDER BY sort_order, id`,
         [item.id]
       );
-      const serviceLabel = (SERVICE_CATALOG[item.service_type] && SERVICE_CATALOG[item.service_type].label) || item.service_type;
+      const serviceLabel = item.index_searched
+        || DEFAULT_INDEX_SEARCHED[item.service_type]
+        || (SERVICE_CATALOG[item.service_type] && SERVICE_CATALOG[item.service_type].label)
+        || item.service_type;
       sections.push({
         item: {
           id: item.id,
@@ -566,7 +593,7 @@ router.post('/orders/:reference/files', requireAdminKey, upload.single('file'), 
       [order.id, req.file.originalname, req.file.mimetype, req.file.size, req.file.buffer]
     );
     res.status(201).json({ file: result.rows[0] });
-  } catch (err) {
+    } catch (err) {
     console.error('Upload order file error:', err);
     res.status(500).json({ error: 'Could not upload file.' });
   }
@@ -644,4 +671,3 @@ router.delete('/files/:fileId', requireAdminKey, async (req, res) => {
 });
 
 module.exports = router;
-
