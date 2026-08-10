@@ -82,6 +82,13 @@ const migrations = [
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   )`,
   `CREATE INDEX IF NOT EXISTS idx_search_request_filings_request ON search_request_filings(search_request_id)`,
+
+  // Lets staff override the "Index Searched" headline shown on the
+  // search result report (defaults to a per-service-type value like
+  // "UCC" or "Federal Lien/Judgment Lien" chosen to match the wording
+  // clients are used to seeing from other providers), or type a fully
+  // custom headline when the default doesn't fit.
+  `ALTER TABLE search_requests ADD COLUMN IF NOT EXISTS index_searched TEXT`,
 ];
 
 (async () => {
