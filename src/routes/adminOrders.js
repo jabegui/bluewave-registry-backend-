@@ -5,6 +5,7 @@ const db = require('../db');
 const { requireAdminKey } = require('../middleware/auth');
 const { buildSearchMatrix, SERVICE_CATALOG } = require('../services/orderMatrix');
 const { renderCombinedSearchReportPdf } = require('../services/searchResultPdf');
+const { generateInvoiceForOrder } = require('../services/invoiceGenerator');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
@@ -206,6 +207,21 @@ router.post('/orders', requireAdminKey, async (req, res) => {
 
     await client.query('COMMIT');
 
+    // Auto-draft an invoice from the subjects/services just entered so
+    // staff don't have to open a separate "generate invoice" step later.
+    // Priced straight from service_prices; staff can still edit line
+    // items afterward via the Edit Invoice modal. Uses its own DB client
+    // and transaction (see invoiceGenerator.js), so if this fails for any
+    // reason the order itself is still created successfully -- staff can
+    // fall back to generating the invoice manually from the dashboard.
+    let invoiceNumber = null;
+    try {
+      const invoiceResult = await generateInvoiceForOrder(order.id);
+      invoiceNumber = invoiceResult.invoice.invoice_number;
+    } catch (invErr) {
+      console.error('Auto-invoice generation failed for order', order.id, invErr);
+    }
+
     res.status(201).json({
       order: {
         id: order.id,
@@ -214,6 +230,7 @@ router.post('/orders', requireAdminKey, async (req, res) => {
         createdAt: order.created_at,
         receivedAt: order.received_at,
         lineItemCount: matrix.length,
+        invoiceNumber,
       },
     });
   } catch (err) {
@@ -593,7 +610,7 @@ router.post('/orders/:reference/files', requireAdminKey, upload.single('file'), 
       [order.id, req.file.originalname, req.file.mimetype, req.file.size, req.file.buffer]
     );
     res.status(201).json({ file: result.rows[0] });
-    } catch (err) {
+  } catch (err) {
     console.error('Upload order file error:', err);
     res.status(500).json({ error: 'Could not upload file.' });
   }
@@ -671,3 +688,4 @@ router.delete('/files/:fileId', requireAdminKey, async (req, res) => {
 });
 
 module.exports = router;
+
